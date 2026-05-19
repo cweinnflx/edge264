@@ -66,6 +66,7 @@
   <li><a href="#ex4">Example 4: Profiling with --prof</a></li>
   <li><a href="#ex5">Example 5: Benchmarking Decode Performance</a></li>
   <li><a href="#ref">Quick Reference</a></li>
+  <li><a href="#regression">Version Comparison</a></li>
 </ul>
 </div>
 
@@ -567,6 +568,55 @@ node --prof-process v8.log
 <tr><td><code>vtbl.8 dN, {dM, ...}, dK</code></td><td>NEON table lookup (8 bytes at a time)</td></tr>
 <tr><td><code>bl #offset</code> + comment <code>;; near builtin entry</code></td><td>Call to V8 builtin (JS-to-WASM wrapper, deopt, etc.)</td></tr>
 </table>
+
+<!-- ================================================================== -->
+<hr class="separator">
+<h2 id="regression">Version Comparison</h2>
+
+<p>Comparing the current HEAD against an older, known-faster version
+(<code>f8809f7</code> &mdash; "General cleanup on and around Intra") on armhf with
+<code>--no-wasm-bounds-checks --no-wasm-stack-checks</code>.</p>
+
+<h3>How to compare</h3>
+<pre>
+<span class="comment"># Build the old version's WASM (uses SSE-to-WASM SIMD path)</span>
+emcc edge264.c -c -D__i386__ -D__x86_64__ \
+  -msimd128 -msse -msse2 -msse3 -mssse3 -msse4.1 -msse4.2 -mavx -mavx2 \
+  -std=gnu11 -O3 -flax-vector-conversions -Wno-override-init \
+  -Wno-initializer-overrides -g -o edge264.o
+emcc edge264.o \
+  -sEXPORTED_FUNCTIONS=_malloc,_free,_edge264_find_start_code,_edge264_alloc,\
+_edge264_flush,_edge264_free,_edge264_decode_NAL,_edge264_get_frame,_edge264_return_frame \
+  -sSTRICT=1 -sALLOW_MEMORY_GROWTH=1 --profiling-funcs -o edge264.js
+
+<span class="comment"># Copy to device and benchmark</span>
+./d8_armhf --no-wasm-bounds-checks --no-wasm-stack-checks \
+  run_decode.js -- netflixtest.264 5
+</pre>
+
+<div class="note">
+  The old version predates native WASM SIMD support in the codebase, so it must be compiled
+  using the SSE compatibility path (<code>-D__i386__ -D__x86_64__</code> with
+  <code>-msse</code> through <code>-mavx2</code>). Emscripten translates these x86 intrinsics
+  to WASM SIMD128 instructions. The current version uses native WASM SIMD directly.
+</div>
+
+<div class="note">
+  The old version uses a 7-parameter <code>edge264_decode_NAL</code> API (with
+  <code>non_blocking</code> and <code>next_NAL</code> output pointer). The
+  <code>run_decode.js</code> script auto-detects this by checking
+  <code>decode_NAL.length</code> and adjusts the decode loop accordingly.
+</div>
+
+<h3>Results (jamba Rock5B, Cortex-A76, armhf, 480x270 H.264)</h3>
+<table>
+<tr><th>Version</th><th>SHA</th><th>fps</th><th>ms/frame</th></tr>
+<tr><td>Old (f8809f7)</td><td><code>f8809f7</code></td><td>1264</td><td>0.79</td></tr>
+<tr><td>Current (HEAD)</td><td><code>HEAD</code></td><td>1047</td><td>0.96</td></tr>
+</table>
+
+<p>The current version is <strong>21.5% slower</strong> than the old version (0.96 vs 0.79 ms/frame).
+Use <code>--prof</code> on both versions to identify which functions regressed.</p>
 
 <p style="margin-top:2rem;color:#666;font-size:0.85rem;">
 Generated from edge264 WASM demo &mdash; d8 v13.2.152.45 on jamba (Rock5B, Cortex-A76, armhf).

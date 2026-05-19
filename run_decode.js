@@ -30,10 +30,17 @@ const get_frame = instance.exports.edge264_get_frame;
 const flush = instance.exports.edge264_flush;
 const edge264_free = instance.exports.edge264_free;
 
+// Detect API version by checking edge264_decode_NAL parameter count:
+//   5 params (current): decode_NAL(dec, buf, end, unref_cb, unref_arg)
+//   7 params (old):     decode_NAL(dec, buf, end, non_blocking, unref_cb, unref_arg, next_NAL)
+const oldAPI = (decode_NAL.length === 7);
+
 // Parse arguments
 const filename = arguments[0];
 const numPasses = parseInt(arguments[1]) || 3;
 if (!filename) { print("Usage: d8 run_decode.js -- <file.264> [passes]"); quit(1); }
+print("API: edge264_decode_NAL has " + decode_NAL.length + " params (" +
+      (oldAPI ? "old" : "current") + ")");
 
 // Load file into WASM memory
 const fileBytes = new Uint8Array(readbuffer(filename));
@@ -46,22 +53,46 @@ const decPtr = alloc(0, 0, 0, 0, 0, 0, 0);
 const ENOBUFS = 42;
 const ENOTSUP = 138;
 
+// Old API (7 params): decode_NAL writes the next NAL pointer to a provided
+// address, so we allocate 4 bytes to hold it.
+const nalPtr = oldAPI ? malloc(4) : 0;
+
 // Decode one full pass, return frame count
 function decodePass() {
   const u8 = new Uint8Array(mem.buffer);
   let nalPos = bufPtr + 3 + (u8[bufPtr + 2] === 0 ? 1 : 0);
   let frameCount = 0;
 
-  while (nalPos < bufEnd) {
-    const nalEnd = find_start_code(nalPos, bufEnd, 0);
-    const ret = decode_NAL(decPtr, nalPos, nalEnd, 0, 0);
+  if (oldAPI) {
+    // Old API: decode_NAL(dec, buf, end, non_blocking, unref_cb, unref_arg, &next_NAL)
+    // Pass the entire buffer as end — the decoder finds NAL boundaries internally
+    // and writes the next NAL position into nalPtr.  Returns 0 on success or
+    // ENOBUFS when next_NAL has passed bufEnd (end-of-stream).
+    const u32 = new Uint32Array(mem.buffer);
+    u32[nalPtr / 4] = nalPos;
+    let ret;
 
-    while (get_frame(decPtr, frmPtr, 0) === 0) {
-      frameCount++;
+    do {
+      ret = decode_NAL(decPtr, u32[nalPtr / 4], bufEnd, 0, 0, 0, nalPtr);
+
+      while (get_frame(decPtr, frmPtr, 0) === 0) {
+        frameCount++;
+      }
+    } while (ret === 0 || (ret === ENOBUFS && u32[nalPtr / 4] < bufEnd));
+  } else {
+    // Current API: decode_NAL(dec, buf, end, unref_cb, unref_arg)
+    // Caller manages NAL boundaries via find_start_code.
+    while (nalPos < bufEnd) {
+      const nalEnd = find_start_code(nalPos, bufEnd, 0);
+      const ret = decode_NAL(decPtr, nalPos, nalEnd, 0, 0);
+
+      while (get_frame(decPtr, frmPtr, 0) === 0) {
+        frameCount++;
+      }
+
+      if (ret !== ENOBUFS) nalPos = nalEnd + 3;
+      if (ret !== 0 && ret !== ENOBUFS && ret !== ENOTSUP) break;
     }
-
-    if (ret !== ENOBUFS) nalPos = nalEnd + 3;
-    if (ret !== 0 && ret !== ENOBUFS && ret !== ENOTSUP) break;
   }
 
   flush(decPtr);
@@ -104,5 +135,6 @@ const ptrPtr = malloc(4);
 new Uint32Array(mem.buffer)[ptrPtr >> 2] = decPtr;
 edge264_free(ptrPtr);
 free(ptrPtr);
+if (nalPtr) free(nalPtr);
 free(frmPtr);
 free(bufPtr);
