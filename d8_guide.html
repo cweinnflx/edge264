@@ -610,13 +610,19 @@ _edge264_flush,_edge264_free,_edge264_decode_NAL,_edge264_get_frame,_edge264_ret
 
 <h3>Results (jamba Rock5B, Cortex-A76, armhf, 480x270 H.264)</h3>
 <table>
-<tr><th>Version</th><th>SHA</th><th>fps</th><th>ms/frame</th></tr>
-<tr><td>Old (f8809f7)</td><td><code>f8809f7</code></td><td>1264</td><td>0.79</td></tr>
-<tr><td>Current (HEAD)</td><td><code>HEAD</code></td><td>1047</td><td>0.96</td></tr>
+<tr><th>Version</th><th>SHA</th><th>SIMD Backend</th><th>fps</th><th>ms/frame</th></tr>
+<tr><td>Old</td><td><code>f8809f7</code></td><td>SSE (via emscripten)</td><td>1264</td><td>0.79</td></tr>
+<tr><td>Current</td><td><code>HEAD</code></td><td>native WASM SIMD</td><td>1047</td><td>0.96</td></tr>
+<tr><td>Current</td><td><code>HEAD</code></td><td>SSE (via emscripten)</td><td>1035</td><td>0.97</td></tr>
 </table>
 
 <p>The current version is <strong>21.5% slower</strong> than the old version (0.96 vs 0.79 ms/frame).
-Use <code>--prof</code> on both versions to identify which functions regressed.</p>
+Building the current code with the SSE backend (same as the old version) produces nearly
+identical performance to the native WASM SIMD build (0.97 vs 0.96 ms/frame), confirming
+that <strong>the SIMD backend is not the source of the regression</strong>. The slowdown is
+in the C algorithm changes between the two versions.</p>
+
+<p>Use <code>--prof</code> on both versions to identify which functions regressed.</p>
 
 <p style="margin-top:2rem;color:#666;font-size:0.85rem;">
 Generated from edge264 WASM demo &mdash; d8 v13.2.152.45 on jamba (Rock5B, Cortex-A76, armhf).
