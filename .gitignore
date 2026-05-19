@@ -9,3 +9,5 @@
 !*.in
 !tests
 !tests/*.yaml
+!build_demo.sh
+!edge264_demo.js
