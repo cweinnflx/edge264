@@ -16,5 +16,6 @@
 !run_decode.js
 !js_hotloop.js
 !wasm_funcmap.sh
+!netflixtest.264
 !d8
 !d8/*
