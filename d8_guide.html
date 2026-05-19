@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>d8 WASM Inspection Guide &mdash; edge264</title>
+<style>
+  :root { --bg: #1a1a2e; --fg: #e0e0e0; --accent: #0f3460; --hl: #e94560; --code-bg: #16213e; --border: #333; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         background: var(--bg); color: var(--fg); line-height: 1.6; padding: 2rem; max-width: 960px; margin: 0 auto; }
+  h1 { color: var(--hl); font-size: 1.8rem; margin-bottom: 0.5rem; border-bottom: 2px solid var(--hl); padding-bottom: 0.5rem; }
+  h2 { color: #53a8b6; font-size: 1.4rem; margin-top: 2rem; margin-bottom: 0.5rem; }
+  h3 { color: #79c7c5; font-size: 1.1rem; margin-top: 1.2rem; margin-bottom: 0.4rem; }
+  p, li { margin-bottom: 0.5rem; }
+  ul { padding-left: 1.5rem; }
+  a { color: #53a8b6; }
+  code { background: var(--code-bg); padding: 0.15rem 0.4rem; border-radius: 3px; font-size: 0.9em; font-family: "SF Mono", "Fira Code", monospace; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto;
+        font-size: 0.82rem; line-height: 1.45; font-family: "SF Mono", "Fira Code", monospace; margin: 0.8rem 0; }
+  pre .comment { color: #6a9955; }
+  pre .keyword { color: #569cd6; }
+  pre .simd { color: #dcdcaa; }
+  table { border-collapse: collapse; margin: 0.8rem 0; width: 100%; }
+  th, td { border: 1px solid var(--border); padding: 0.4rem 0.8rem; text-align: left; font-size: 0.9rem; }
+  th { background: var(--accent); }
+  .toc { background: var(--code-bg); border-radius: 6px; padding: 1rem 1.5rem; margin: 1rem 0; }
+  .toc ul { list-style: none; padding-left: 0; }
+  .toc li { margin: 0.3rem 0; }
+  .toc a { text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .note { background: #1b2838; border-left: 4px solid #53a8b6; padding: 0.8rem 1rem; border-radius: 4px; margin: 0.8rem 0; font-size: 0.9rem; }
+  .warn { background: #2a1a1a; border-left: 4px solid var(--hl); padding: 0.8rem 1rem; border-radius: 4px; margin: 0.8rem 0; font-size: 0.9rem; }
+  .separator { border: 0; border-top: 1px solid var(--border); margin: 2rem 0; }
+  .badge { display: inline-block; background: var(--accent); padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.8rem; margin-right: 0.3rem; }
+  details { margin: 0.5rem 0; }
+  summary { cursor: pointer; color: #53a8b6; font-weight: bold; }
+  summary:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<h1>d8 WASM Inspection Guide</h1>
+<p>Using V8's <code>d8</code> shell to inspect the machine code generated for edge264's WebAssembly decoder on ARM (jamba device, Rock5B / Cortex-A76).</p>
+<p><strong>d8 version:</strong> 13.2.152.45 &nbsp; <strong>Target:</strong> armhf (ARM32 NEON) &nbsp; <strong>Test file:</strong> 718 frames, 480x270 H.264</p>
+
+<div class="note">
+  Examples use <code>./d8_armhf</code> (32-bit ARM) with
+  <code>--no-wasm-bounds-checks --no-wasm-stack-checks</code> to disable WASM safety checks.
+  These checks add ~7.5% overhead on ARM32 due to limited registers. On aarch64 the overhead
+  is only ~2.7%, so the flags are less important there.
+  <br><br>
+  An aarch64 build (<code>./d8_aarch64</code>) is also available and can be used with the
+  same commands (without the check-disabling flags). The aarch64 version produces AArch64 A64
+  instructions instead of ARM32 T32/A32, and runs ~20% faster due to wider registers and
+  additional architectural features.
+</div>
+
+<div class="toc">
+<strong>Contents</strong>
+<ul>
+  <li><a href="#what-is-d8">What is d8?</a></li>
+  <li><a href="#setup">Setup</a></li>
+  <li><a href="#ex1">Example 1: WASM Compiled Code Inspection</a></li>
+  <li><a href="#ex2">Example 2: WASM SIMD128 &rarr; ARM NEON Codegen</a></li>
+  <li><a href="#ex3">Example 3: JS Hot Loop Optimization</a></li>
+  <li><a href="#ex4">Example 4: Profiling with --prof</a></li>
+  <li><a href="#ex5">Example 5: Benchmarking Decode Performance</a></li>
+  <li><a href="#ref">Quick Reference</a></li>
+</ul>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="what-is-d8">What is d8?</h2>
+
+<p><code>d8</code> is V8's standalone JavaScript shell. It runs JavaScript and WebAssembly outside
+of a browser or Node.js, providing direct access to V8's internals. Unlike Chrome DevTools,
+d8 can dump the <strong>actual machine code</strong> that V8 generates for both WASM and JS functions.</p>
+
+<p>V8 compiles code through multiple tiers:</p>
+<ul>
+  <li><strong>Liftoff</strong> &mdash; baseline compiler for WASM. Generates code fast but without optimization. Single-pass, register-allocating compiler.</li>
+  <li><strong>TurboFan</strong> &mdash; optimizing compiler for both WASM and JS. Generates high-quality machine code with inlining, SIMD vectorization, and register allocation. Takes longer to compile.</li>
+  <li><strong>Maglev</strong> &mdash; mid-tier JS compiler (between Ignition bytecode and TurboFan). Not used for WASM.</li>
+</ul>
+
+<p>For WASM, Liftoff compiles functions on first call (lazy baseline). TurboFan recompiles hot
+functions in the background. For JS, functions start as Ignition bytecode, get promoted to
+Maglev, then TurboFan when they're hot enough.</p>
+
+<div class="note">
+  <strong>Key insight:</strong> d8 runs the <em>same V8 engine</em> as NRDP on the jamba device.
+  The machine code you see in d8 is exactly what NRDP generates when decoding video.
+</div>
+
+<!-- ================================================================== -->
+<h2 id="setup">Setup</h2>
+
+<h3>Building edge264.wasm with function names</h3>
+<p>For d8 profiling and code inspection to show function names (instead of bare indices like
+<code>wasm-function[44]</code>), the WASM binary must include the <strong>name section</strong>.
+This requires two flags:</p>
+
+<ul>
+  <li><code>CFLAGS="-g"</code> &mdash; tells the compiler to emit debug names into the object file</li>
+  <li><code>LIBFLAGS="--profiling-funcs"</code> &mdash; tells the emscripten linker to preserve the
+      WASM name section in the final <code>.wasm</code> output</li>
+</ul>
+
+<div class="warn">
+  <strong>Both flags are required.</strong> Using <code>-g</code> alone is not enough &mdash;
+  emscripten's linker strips the name section by default even when debug info is present.
+  The <code>--profiling-funcs</code> flag keeps it. Neither flag changes the generated code
+  or optimization level; <code>-O3</code> is still applied.
+</div>
+
+<pre>
+<span class="comment"># Build with function names preserved (used by build_demo.sh)</span>
+emmake make OS=wasm VARIANTS= BUILDTEST=no CFLAGS="-g" LIBFLAGS="--profiling-funcs"
+
+<span class="comment"># Verify the name section exists</span>
+wasm-objdump -h edge264.wasm | grep name
+<span class="comment">#   Custom start=0x... end=0x... (size=0x00000b20) "name"</span>
+</pre>
+
+<p>This adds ~3KB to the binary (182KB &rarr; 185KB) with zero runtime performance impact.</p>
+
+<h3>Files needed in the working directory</h3>
+<pre>
+./d8_armhf             <span class="comment"># d8 binary (ARM32 hard-float)</span>
+edge264.wasm           <span class="comment"># compiled decoder (built with --profiling-funcs)</span>
+netflixtest.264        <span class="comment"># test bitstream</span>
+run_decode.js          <span class="comment"># d8 decode script</span>
+js_hotloop.js          <span class="comment"># JS hot loop script (for Example 3)</span>
+</pre>
+
+<h3>The d8 decode script: <code>run_decode.js</code></h3>
+<p>This script loads the WASM module, instantiates it with stub imports (no browser APIs needed),
+loads a .264 file into WASM memory, and runs the full decode loop with benchmarking.
+It runs a warmup pass first (which includes Liftoff compilation and TurboFan recompilation),
+then multiple timed passes using the fully optimized TurboFan code.</p>
+
+<pre>
+<span class="comment"># Basic usage (3 timed passes after warmup)</span>
+./d8_armhf --no-wasm-bounds-checks --no-wasm-stack-checks run_decode.js -- netflixtest.264
+
+<span class="comment"># Specify number of timed passes</span>
+./d8_armhf --no-wasm-bounds-checks --no-wasm-stack-checks run_decode.js -- netflixtest.264 5
+</pre>
+
+<h3>Sample output</h3>
+<pre>
+pass 0 (warmup)...
+  718 frames (Liftoff + TurboFan compilation)
+pass 1: 718 frames in 675.5 ms (1062.9 fps, 0.94 ms/frame)
+pass 2: 718 frames in 674.7 ms (1064.2 fps, 0.94 ms/frame)
+pass 3: 718 frames in 674.1 ms (1065.1 fps, 0.94 ms/frame)
+
+summary (3 passes, 718 frames each):
+  avg: 673.4 ms (1066.3 fps, 0.94 ms/frame)
+  min: 670.6 ms  max: 675.5 ms
+</pre>
+
+<div class="note">
+  <strong>Pass 0 (warmup)</strong> is not timed. It triggers Liftoff baseline compilation on
+  first function calls, then TurboFan recompiles hot functions in the background.
+  Subsequent passes run entirely on optimized TurboFan code. The warmup is essential &mdash;
+  without it, pass 1 would include compilation overhead and appear much slower.
+</div>
+
+<!-- ================================================================== -->
+<hr class="separator">
+<h2 id="ex1">Example 1: WASM Compiled Code Inspection</h2>
+
+<p>Dump the ARM machine code V8 generates for all WASM functions that get compiled during decoding.</p>
+
+<h3>Command</h3>
+<pre>
+<span class="comment"># Dump ALL compiled functions (Liftoff + TurboFan) to a file</span>
+./d8_armhf --no-wasm-bounds-checks --no-wasm-stack-checks \
+  --print-wasm-code run_decode.js -- netflixtest.264 &gt; wasm_code.txt
+
+<span class="comment"># Search for a specific function by name</span>
+grep -A500 'name: edge264_find_start_code' wasm_code.txt
+grep -A500 'name: decode_inter' wasm_code.txt
+</pre>
+
+<h3>Output format</h3>
+<p>Each function produces a block like this (function names come from the WASM name section):</p>
+<pre>
+name: edge264_find_start_code
+index: 44
+kind: wasm function
+compiler: TurboFan              <span class="comment">&larr; Liftoff or TurboFan</span>
+Body (size = 864 = 840 + 24 padding)
+Instructions (size = 824)
+0x3c26796200     0  d2800110       movz x16, #0x8
+0x3c26796204     4  a9be43e7       stp x7, x16, [sp, #-32]!
+...
+</pre>
+
+<h3>What to look for</h3>
+<ul>
+  <li><strong>Compiler tier:</strong> <code>Liftoff</code> = baseline (fast compile, unoptimized), <code>TurboFan</code> = optimized</li>
+  <li><strong>Body size:</strong> larger functions are the decoder hot paths (edge264_slice, edge264_headers)</li>
+  <li><strong>Function appears twice:</strong> first as Liftoff, then as TurboFan after V8 recompiles it</li>
+</ul>
+
+<h3>Results: TurboFan-compiled functions</h3>
+<p>Out of ~100+ total WASM functions, 26 were promoted to TurboFan during the 718-frame decode:</p>
+
+<table>
+<tr><th>Function</th><th>Index</th><th>TurboFan Size</th><th>Role</th></tr>
+<tr><td><code>decode_inter</code></td><td>22</td><td>27,520 bytes</td><td>Inter prediction &mdash; hottest function (65% of time)</td></tr>
+<tr><td><code>parse_slice_layer_without_partitioning</code></td><td>33</td><td>28,576 bytes</td><td>Top-level slice parsing</td></tr>
+<tr><td><code>parse_slice_data_cabac</code></td><td>13</td><td>18,048 bytes</td><td>CABAC macroblock loop</td></tr>
+<tr><td><code>deblock_mb</code></td><td>14</td><td>13,760 bytes</td><td>In-loop deblocking filter</td></tr>
+<tr><td><code>worker_loop</code></td><td>11</td><td>11,456 bytes</td><td>Decode worker entry point</td></tr>
+<tr><td><code>decode_direct_mv_pred</code></td><td>24</td><td>4,320 bytes</td><td>B-slice direct motion vector prediction</td></tr>
+<tr><td><code>parse_I_mb_cabac</code></td><td>27</td><td>8,480 bytes</td><td>Intra macroblock CABAC parsing</td></tr>
+<tr><td><code>edge264_find_start_code</code></td><td>44</td><td>864 bytes</td><td>SIMD start-code byte scanning</td></tr>
+</table>
+
+<!-- ================================================================== -->
+<hr class="separator">
+<h2 id="ex2">Example 2: WASM SIMD128 &rarr; ARM NEON Codegen</h2>
+
+<p>The most interesting inspection: how V8 translates WASM's platform-independent SIMD128
+instructions into ARM NEON machine code. The <code>edge264_find_start_code</code> function
+is a compact example that uses SIMD to scan for H.264 start codes
+(<code>00 00 01</code>) in the byte stream.</p>
+
+<h3>Command</h3>
+<pre>
+./d8_armhf --no-wasm-bounds-checks --no-wasm-stack-checks \
+  --print-wasm-code run_decode.js -- netflixtest.264 2&gt;&amp;1 | \
+  grep -A500 'name: edge264_find_start_code' | \
+  grep -A500 'compiler: TurboFan' | head -120
+</pre>
+
+<h3>SIMD Instruction Mapping</h3>
+<table>
+<tr><th>WASM SIMD128</th><th>ARM32 NEON Generated</th><th>Purpose</th></tr>
+<tr><td><code>v128.load</code></td><td><code>vld1.8 {d0, d1}, [r0]</code></td><td>Load 16 bytes from memory</td></tr>
+<tr><td><code>i8x16.eq</code> (vs 0)</td><td><code>vceq.i8 q3, q1, q2</code></td><td>Compare each byte == 0</td></tr>
+<tr><td><code>i8x16.eq</code> (vs 1)</td><td><code>vceq.i8 q2, q2, q4</code></td><td>Compare each byte == 1</td></tr>
+<tr><td><code>v128.bitselect</code></td><td><code>vbsl q3, q0, q1</code></td><td>Bitwise select (mask blend)</td></tr>
+<tr><td><code>i8x16.shuffle</code> (shift 14)</td><td><code>vext.8 q4, q1, q3, #14</code></td><td>Cross-register byte shuffle</td></tr>
+<tr><td><code>i8x16.shuffle</code> (shift 15)</td><td><code>vext.8 q1, q1, q3, #15</code></td><td>Cross-register byte shuffle</td></tr>
+<tr><td><code>v128.and</code></td><td><code>vand q0, q4, q0</code></td><td>Bitwise AND of two masks</td></tr>
+<tr><td><code>i8x16.swizzle</code></td><td><code>vtbl.8 d0, {d2, d3}, d14</code></td><td>Table lookup (byte permute, 8 bytes at a time)</td></tr>
+<tr><td><code>u16x8.shr</code></td><td><code>vshr.u16 q1, q2, #4</code></td><td>Unsigned right shift per lane</td></tr>
+<tr><td><code>v128.const</code> (all 1s)</td><td><code>vmov.i8 q0, 255</code></td><td>Vector constant</td></tr>
+</table>
+
+<div class="note">
+  ARM32 NEON uses <code>q</code> registers (128-bit, made of two <code>d</code> registers).
+  The <code>vtbl</code> instruction only operates on 8 bytes at a time, so a 16-byte swizzle
+  requires two <code>vtbl.8</code> instructions. AArch64's <code>tbl</code> handles all 16 bytes
+  in one instruction.
+</div>
+
+<h3>The inner loop (annotated)</h3>
+<p>This is the core of the start-code search. It processes 16 bytes at a time, looking for the
+<code>00 00 01</code> pattern:</p>
+
+<pre>
+<span class="comment">; === Inner loop: scan 16 bytes per iteration (ARM32 NEON) ===</span>
+
+<span class="comment">; Compare each byte against 0 (find zero bytes)</span>
+<span class="simd">vceq.i8 q1, q2, q1</span>           <span class="comment">; q1[i] = (data[i] == 0) ? 0xFF : 0x00</span>
+
+<span class="comment">; Shift the previous zero-mask and current zero-mask to check</span>
+<span class="comment">; for consecutive zeros across the 16-byte boundary</span>
+<span class="simd">vext.8 q4, q1, q3, #14</span>       <span class="comment">; shift right 14: prev[14..15] + cur[0..13]</span>
+<span class="simd">vext.8 q1, q1, q3, #15</span>       <span class="comment">; shift right 15: prev[15] + cur[0..14]</span>
+
+<span class="comment">; AND the two shifted masks: true where TWO consecutive zeros exist</span>
+<span class="simd">vand q1, q4, q1</span>              <span class="comment">; two_zeros_mask</span>
+
+<span class="comment">; Compare against 1 (find the 0x01 byte after the two zeros)</span>
+<span class="simd">vceq.i8 q2, q2, q4</span>           <span class="comment">; q2[i] = (data[i] == 1) ? 0xFF : 0x00</span>
+
+<span class="comment">; Bitselect: result = two_zeros &amp; is_one (true where 00 00 01 found)</span>
+<span class="simd">vbsl q2, q1, q0</span>              <span class="comment">; q2 = (q2 &amp; q1) | (~q2 &amp; zeros)</span>
+
+<span class="comment">; Pack result to find the byte position of the match</span>
+<span class="simd">vshr.u16 q1, q2, #4</span>          <span class="comment">; shift to pack match bits</span>
+<span class="simd">vtbl.8 d14, {d2, d3}, d14</span>    <span class="comment">; permute low 8 bytes</span>
+<span class="simd">vtbl.8 d15, {d2, d3}, d15</span>    <span class="comment">; permute high 8 bytes</span>
+<span class="keyword">vmov q1, q7</span>                   <span class="comment">; extract to scalar registers</span>
+<span class="keyword">cmp r0, #0</span>                    <span class="comment">; no match? advance 16 bytes</span>
+
+<span class="comment">; Match found: use clz to find exact byte offset</span>
+<span class="keyword">blx r4</span>                        <span class="comment">; call wasm::word32_ctz</span>
+</pre>
+
+<div class="note">
+  The mapping is nearly 1:1 &mdash; most WASM SIMD128 instructions compile to a single NEON
+  instruction. The main exception is <code>i8x16.swizzle</code> which requires two
+  <code>vtbl.8</code> instructions on ARM32 (since <code>vtbl</code> only handles 8 bytes).
+  On AArch64, this is a single <code>tbl v0.16b</code> instruction.
+</div>
+
+<!-- ================================================================== -->
+<hr class="separator">
+<h2 id="ex3">Example 3: JS Hot Loop Optimization</h2>
+
+<p>Inspect the machine code TurboFan generates for a <strong>JavaScript</strong> function that calls
+WASM. This shows the JS-to-WASM call overhead and how TurboFan optimizes the decode loop.</p>
+
+<h3>Script: <code>js_hotloop.js</code></h3>
+<p>Wraps the decode loop in a named JS function and runs it multiple times to trigger optimization:</p>
+
+<details>
+<summary>View full source</summary>
+<pre>
+<span class="comment">// ... same WASM setup as run_decode.js ...</span>
+
+const ENOBUFS = 42;
+const ENOTSUP = 138;
+
+<span class="comment">// The hot decode loop we want TurboFan to optimize</span>
+function decodeAllFrames(bufPtr, bufEnd, frmPtr, decPtr) {
+  let u8 = new Uint8Array(mem.buffer);
+  let nalPos = bufPtr + 3 + (u8[bufPtr + 2] === 0 ? 1 : 0);
+  let frameCount = 0;
+
+  while (nalPos &lt; bufEnd) {
+    const nalEnd = find_start_code(nalPos, bufEnd, 0);
+    const ret = decode_NAL(decPtr, nalPos, nalEnd, 0, 0);
+
+    while (get_frame(decPtr, frmPtr, 0) === 0) {
+      frameCount++;
+    }
+
+    if (ret !== ENOBUFS) nalPos = nalEnd + 3;
+    if (ret !== 0 &amp;&amp; ret !== ENOBUFS &amp;&amp; ret !== ENOTSUP) break;
+  }
+
+  flush(decPtr);
+  while (get_frame(decPtr, frmPtr, 0) === 0) frameCount++;
+  return frameCount;
+}
+
+<span class="comment">// Run 3x to trigger TurboFan optimization (Ignition &rarr; Maglev &rarr; TurboFan)</span>
+for (let i = 0; i &lt; 3; i++) {
+  flush(decPtr);
+  const count = decodeAllFrames(bufPtr, bufEnd, frmPtr, decPtr);
+  print("pass " + i + ": " + count + " frames");
+}
+</pre>
+</details>
+
+<h3>Command</h3>
+<pre>
+./d8_armhf --no-wasm-bounds-checks --no-wasm-stack-checks \
+  --print-opt-code --print-opt-code-filter="decodeAllFrames" js_hotloop.js -- netflixtest.264
+</pre>
+
+<h3>Output</h3>
+<p>TurboFan generates optimized ARM code for <code>decodeAllFrames</code>.
+The output includes the raw source, optimization metadata, and full disassembly:</p>
+
+<pre>
+--- Optimized code ---
+optimization_id = 2
+source_position = 990
+kind = TURBOFAN_JS
+name = decodeAllFrames
+stack_slots = 14
+compiler = turbofan
+
+Instructions (size = 1828)
+0xaaaaf0000614    14  a9bf7bfd       stp fp, lr, [sp, #-16]!
+0xaaaaf0000618    18  910003fd       mov fp, sp
+<span class="comment">; ... JS-to-WASM wrapper calls, loop control, type checks ...</span>
+</pre>
+
+<h3>What to observe</h3>
+<ul>
+  <li><strong>Deoptimization guards</strong> at function entry (<code>tbz</code> checking feedback vector bits)</li>
+  <li><strong>Uint8Array type checks</strong> &mdash; TurboFan verifies the map/type of the typed array on each access</li>
+  <li><strong>SMI (Small Integer) arithmetic</strong> &mdash; pointer values are tagged with shift-left-1; you'll see <code>asr w8, w6, #1</code> to untag</li>
+  <li><strong>WASM call sequences</strong> &mdash; calls into WASM go through <code>JSToWasmWrapperAsm</code> builtins</li>
+  <li><strong>Overflow checks</strong> &mdash; <code>adds</code> + <code>b.vs</code> patterns guard integer additions against overflow</li>
+</ul>
+
+<!-- ================================================================== -->
+<hr class="separator">
+<h2 id="ex4">Example 4: Profiling with --prof</h2>
+
+<p>Statistical profiling shows where time is spent across both JS and WASM code. The profiler
+samples the instruction pointer at regular intervals (default: 1ms).</p>
+
+<h3>Commands</h3>
+<pre>
+<span class="comment"># Step 1: Generate the profile (produces v8.log in cwd)</span>
+./d8_armhf --no-wasm-bounds-checks --no-wasm-stack-checks \
+  --prof run_decode.js -- netflixtest.264
+
+<span class="comment"># Step 2: Process the log with node's tick processor</span>
+node --prof-process v8.log
+</pre>
+
+<h3>Profile summary (2848 ticks, 718 frames, armhf)</h3>
+<pre>
+ [Summary]:
+   ticks  total  nonlib   name
+   2812   98.7%   99.5%  JavaScript/WASM
+      0    0.0%    0.0%  GC
+     36    1.3%          Shared libraries
+</pre>
+
+<p>98.7% of time is in WASM code. Zero GC pressure. Minimal C++ runtime overhead.</p>
+
+<h3>Top functions by time</h3>
+<table>
+<tr><th>Ticks</th><th>%</th><th>Function</th><th>Compiler</th></tr>
+<tr><td>1859</td><td>65.3%</td><td><code>decode_inter</code></td><td>TurboFan</td></tr>
+<tr><td>235</td><td>8.3%</td><td><code>parse_NxN_residual_cabac</code></td><td>TurboFan</td></tr>
+<tr><td>156</td><td>5.5%</td><td><code>parse_slice_data_cabac</code></td><td>TurboFan</td></tr>
+<tr><td>84</td><td>2.9%</td><td><code>parse_residual_coeffs_cabac</code></td><td>TurboFan</td></tr>
+<tr><td>76</td><td>2.7%</td><td><code>get_ae</code> (CABAC arithmetic engine)</td><td>TurboFan</td></tr>
+<tr><td>66</td><td>2.3%</td><td><code>parse_mvd_pair_cabac</code></td><td>TurboFan</td></tr>
+<tr><td>47</td><td>1.7%</td><td><code>decode_direct_mv_pred</code></td><td>TurboFan</td></tr>
+<tr><td>40</td><td>1.4%</td><td><code>parse_I_mb_cabac</code></td><td>TurboFan</td></tr>
+<tr><td>36</td><td>1.3%</td><td><code>parse_ref_idx_cabac</code></td><td>TurboFan</td></tr>
+<tr><td>35</td><td>1.2%</td><td><code>add_idct4x4</code></td><td>TurboFan</td></tr>
+</table>
+
+<div class="note">
+  Functions prefixed with <code>*</code> in the raw output are TurboFan-compiled.
+  Without the prefix, they're still running the Liftoff baseline code
+  (e.g., a Liftoff entry for <code>decode_inter</code> represents time spent
+  before TurboFan replaced it).
+</div>
+
+<h3>Bottom-up call tree (top entry)</h3>
+<pre>
+1859   65.3%  JS: *decode_inter
+ 1035   55.7%    JS: *decode_direct_mv_pred
+  1035  100.0%      JS: *parse_slice_data_cabac
+    957   92.5%        JS: *worker_loop
+     914   95.5%          JS: *parse_slice_layer_without_partitioning
+      914  100.0%            JS: edge264_decode_NAL
+</pre>
+
+<p>Reading bottom-up: <code>edge264_decode_NAL</code> calls
+<code>parse_slice_layer_without_partitioning</code> calls <code>worker_loop</code>
+calls <code>parse_slice_data_cabac</code> calls <code>decode_direct_mv_pred</code>
+calls <code>decode_inter</code>. This traces the decoder pipeline from the API entry
+point down through slice parsing to the innermost inter prediction function.</p>
+
+<h3>Additional profiling flags</h3>
+<pre>
+<span class="comment"># Change sampling interval (microseconds)</span>
+./d8_armhf --no-wasm-bounds-checks --no-wasm-stack-checks \
+  --prof --prof-sampling-interval=100 run_decode.js -- netflixtest.264
+
+<span class="comment"># WASM compilation timing</span>
+./d8_armhf --no-wasm-bounds-checks --no-wasm-stack-checks \
+  --trace-wasm-compilation-times run_decode.js -- netflixtest.264
+
+<span class="comment"># TurboFan statistics</span>
+./d8_armhf --no-wasm-bounds-checks --no-wasm-stack-checks \
+  --turbo-stats-wasm run_decode.js -- netflixtest.264
+</pre>
+
+<!-- ================================================================== -->
+<hr class="separator">
+<h2 id="ex5">Example 5: Benchmarking Decode Performance</h2>
+
+<p><code>run_decode.js</code> includes built-in benchmarking with <code>performance.now()</code>.
+It measures pure decode throughput &mdash; no rendering, no JS framework overhead &mdash; giving
+a clean baseline for optimization work.</p>
+
+<h3>Command</h3>
+<pre>
+./d8_armhf --no-wasm-bounds-checks --no-wasm-stack-checks \
+  run_decode.js -- netflixtest.264                <span class="comment"># 3 timed passes (default)</span>
+./d8_armhf --no-wasm-bounds-checks --no-wasm-stack-checks \
+  run_decode.js -- netflixtest.264 10             <span class="comment"># 10 timed passes</span>
+./d8_armhf --no-wasm-bounds-checks --no-wasm-stack-checks \
+  run_decode.js -- other_video.264 5              <span class="comment"># different file, 5 passes</span>
+</pre>
+
+<h3>How it works</h3>
+<ul>
+  <li><strong>Pass 0 (warmup)</strong> &mdash; decodes the entire file once, untimed. This triggers
+      Liftoff baseline compilation and TurboFan background recompilation of hot functions.</li>
+  <li><strong>Passes 1&ndash;N (timed)</strong> &mdash; each pass decodes the entire file again with
+      <code>performance.now()</code> bracketing. All code runs as fully optimized TurboFan.</li>
+  <li><strong>Summary</strong> &mdash; reports avg/min/max time, fps, and ms/frame across all timed passes.</li>
+</ul>
+
+<h3>Sample results (jamba Rock5B, Cortex-A76, armhf, 480x270 H.264)</h3>
+<pre>
+pass 0 (warmup)...
+  718 frames (Liftoff + TurboFan compilation)
+pass 1: 718 frames in 675.5 ms (1062.9 fps, 0.94 ms/frame)
+pass 2: 718 frames in 674.7 ms (1064.2 fps, 0.94 ms/frame)
+pass 3: 718 frames in 674.1 ms (1065.1 fps, 0.94 ms/frame)
+pass 4: 718 frames in 672.0 ms (1068.5 fps, 0.94 ms/frame)
+pass 5: 718 frames in 670.6 ms (1070.7 fps, 0.93 ms/frame)
+
+summary (5 passes, 718 frames each):
+  avg: 673.4 ms (1066.3 fps, 0.94 ms/frame)
+  min: 670.6 ms  max: 675.5 ms
+</pre>
+
+<div class="note">
+  <strong>Why d8 is valid for benchmarking:</strong> d8 runs the same V8 engine and TurboFan
+  compiler as NRDP on the device. The WASM machine code is identical. There is no GC pressure
+  (0% GC in profiling), no browser rendering overhead, and no JS framework in the measurement
+  loop. The sub-0.5% variance across passes confirms stable, reproducible measurements.
+</div>
+
+<h3>Combining with profiling</h3>
+<p>Use <code>--prof</code> alongside benchmarking to identify which functions to optimize:</p>
+<pre>
+<span class="comment"># Profile the benchmark run</span>
+./d8_armhf --no-wasm-bounds-checks --no-wasm-stack-checks \
+  --prof run_decode.js -- netflixtest.264
+
+<span class="comment"># See where time is spent</span>
+node --prof-process v8.log
+</pre>
+
+<!-- ================================================================== -->
+<hr class="separator">
+<h2 id="ref">Quick Reference</h2>
+
+<h3>All d8 flags used in this guide</h3>
+<table>
+<tr><th>Flag</th><th>Purpose</th></tr>
+<tr><td><code>--no-wasm-bounds-checks</code></td><td>Disable WASM memory bounds checking (~7.5% speedup on armhf, ~2.7% on aarch64)</td></tr>
+<tr><td><code>--no-wasm-stack-checks</code></td><td>Disable WASM stack overflow checks (use with bounds checks above)</td></tr>
+<tr><td><code>--print-wasm-code</code></td><td>Dump ARM disassembly for all compiled WASM functions (pipe to file, grep by name)</td></tr>
+<tr><td><code>--print-opt-code</code></td><td>Dump TurboFan-optimized JS function code</td></tr>
+<tr><td><code>--print-opt-code-filter="name"</code></td><td>Filter which JS functions to dump</td></tr>
+<tr><td><code>--prof</code></td><td>Enable statistical profiling (writes v8.log)</td></tr>
+<tr><td><code>--prof-sampling-interval=N</code></td><td>Profiling sample interval in microseconds</td></tr>
+<tr><td><code>--trace-wasm-compilation-times</code></td><td>Print compile time for each WASM function</td></tr>
+<tr><td><code>--turbo-stats-wasm</code></td><td>Print TurboFan compilation statistics</td></tr>
+<tr><td><code>--trace-turbo</code></td><td>Dump TurboFan IR (for turbolizer visualization)</td></tr>
+<tr><td><code>--print-bytecode</code></td><td>Print Ignition bytecode for JS functions</td></tr>
+</table>
+
+<h3>Processing profile logs</h3>
+<pre>
+<span class="comment"># On the device (requires node):</span>
+node --prof-process v8.log
+
+<span class="comment"># Or copy v8.log to your workstation and process there</span>
+</pre>
+
+<h3>Common patterns in ARM32 NEON output</h3>
+<table>
+<tr><th>Pattern</th><th>Meaning</th></tr>
+<tr><td><code>push {fp, lr}</code></td><td>Function prologue (save frame pointer + return address)</td></tr>
+<tr><td><code>ldr r4, [r10, #-NNN]</code></td><td>Stack limit check (r10 = V8 root register)</td></tr>
+<tr><td><code>cmp sp, r4</code> + <code>bls</code></td><td>Stack overflow guard</td></tr>
+<tr><td><code>vld1.8 {d0, d1}, [r0]</code></td><td>NEON 128-bit vector load (as two 64-bit halves)</td></tr>
+<tr><td><code>vceq.i8 qN, ...</code></td><td>NEON byte-wise compare equal</td></tr>
+<tr><td><code>vbsl qN, ...</code></td><td>NEON bitwise select (mux)</td></tr>
+<tr><td><code>vext.8 qN, ..., #K</code></td><td>NEON extract/concatenate (byte-level shift across two registers)</td></tr>
+<tr><td><code>vtbl.8 dN, {dM, ...}, dK</code></td><td>NEON table lookup (8 bytes at a time)</td></tr>
+<tr><td><code>bl #offset</code> + comment <code>;; near builtin entry</code></td><td>Call to V8 builtin (JS-to-WASM wrapper, deopt, etc.)</td></tr>
+</table>
+
+<p style="margin-top:2rem;color:#666;font-size:0.85rem;">
+Generated from edge264 WASM demo &mdash; d8 v13.2.152.45 on jamba (Rock5B, Cortex-A76, armhf).
+</p>
+
+</body>
+</html>

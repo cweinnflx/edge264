@@ -11,3 +11,9 @@
 !tests/*.yaml
 !build_demo.sh
 !edge264_demo.js
+!d8_guide.html
+!run_decode.js
+!js_hotloop.js
+!wasm_funcmap.sh
+!d8
+!d8/*

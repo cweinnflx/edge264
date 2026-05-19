@@ -28,7 +28,7 @@ if ! command -v emcc &>/dev/null; then
 fi
 
 echo "Building edge264 WASM library..."
-emmake make OS=wasm VARIANTS= BUILDTEST=no
+emmake make OS=wasm VARIANTS= BUILDTEST=no CFLAGS="-g" LIBFLAGS="--profiling-funcs"
 
 echo "Generating edge264_demo.html..."
 cat > edge264_demo.html << 'EOF'
