@@ -305,7 +305,7 @@ class VideoRenderer {
         this.sampler = null;
         this.bindGroupLayout = null;
         this.uniformBuffer = null;
-        this.uniformData = new Float32Array(8);
+        this.uniformData = new Float32Array(4);
         this.yTexture = null;
         this.cbTexture = null;
         this.crTexture = null;
@@ -343,7 +343,7 @@ class VideoRenderer {
 
         this.context.configure({ device: this.device, format: this.canvasFormat });
 
-        // --- Shader ---
+         // --- Shader ---
         const shaderCode = `
             struct VertexOutput {
                 @builtin(position) pos: vec4<f32>,
@@ -352,23 +352,29 @@ class VideoRenderer {
 
             struct Uniforms {
                 dest_rect: vec4<f32>,
-                flip_y: f32,
             }
 
             @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
-            const uvs = array<vec2<f32>, 6>(
+            // Vertex positions as 0..1 fractions of the dest_rect.
+            const quad = array<vec2<f32>, 6>(
                 vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
                 vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0)
+            );
+
+            // Texture UVs — Y is flipped so that texture row 0 (top of the
+            // image) maps to NDC y=+1 (top of screen) on all backends.
+            const uvs = array<vec2<f32>, 6>(
+                vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 0.0),
+                vec2<f32>(1.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 0.0)
             );
 
             @vertex
             fn vs(@builtin(vertex_index) i: u32) -> VertexOutput {
                 var out: VertexOutput;
-                let pos = uniforms.dest_rect.xy + (uvs[i] * uniforms.dest_rect.zw);
+                let pos = uniforms.dest_rect.xy + (quad[i] * uniforms.dest_rect.zw);
                 out.pos = vec4<f32>(pos, 0.0, 1.0);
-                let y_coord = select(uvs[i].y, 1.0 - uvs[i].y, uniforms.flip_y < 0.5);
-                out.uv = vec2<f32>(uvs[i].x, y_coord);
+                out.uv = uvs[i];
                 return out;
             }
 
@@ -403,7 +409,7 @@ class VideoRenderer {
 
         // --- Uniform buffer ---
         this.uniformBuffer = this.device.createBuffer({
-            size: 32,  // 8 floats × 4 bytes
+            size: 16,  // 4 floats × 4 bytes (dest_rect)
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         // Fullscreen quad in NDC
@@ -411,8 +417,8 @@ class VideoRenderer {
         this.uniformData[1] = -1.0; // y
         this.uniformData[2] =  2.0; // width
         this.uniformData[3] =  2.0; // height
-        this.uniformData[4] = (isNrdp && this.gpu.backend === "opengl") ? 1.0 : 0.0;
         this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
+        NTRACE("WebGPU backend:", this.gpu.backend || "n/a");
 
         // --- Sampler ---
         this.sampler = this.device.createSampler({
